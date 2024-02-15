@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -181,6 +182,13 @@ func main() {
 	mux.Handle(elizav1connect.NewElizaServiceHandler(
 		NewElizaServer(*streamDelayArg),
 		compress1KB,
+		connect.WithInterceptors(
+			&RequestLoggingInterceptor{
+				slog.New(
+					slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}),
+				),
+			},
+		),
 	))
 	mux.Handle(grpchealth.NewHandler(
 		grpchealth.NewStaticChecker(elizav1connect.ElizaServiceName),
@@ -194,7 +202,7 @@ func main() {
 		grpcreflect.NewStaticReflector(elizav1connect.ElizaServiceName),
 		compress1KB,
 	))
-	addr := "localhost:8080"
+	addr := "localhost:8082"
 	if port := os.Getenv("PORT"); port != "" {
 		addr = ":" + port
 	}
@@ -216,11 +224,56 @@ func main() {
 			log.Fatalf("HTTP listen and serve: %v", err)
 		}
 	}()
-
+	fmt.Println("Server started at", addr)
 	<-signals
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("HTTP shutdown: %v", err) //nolint:gocritic
 	}
+}
+
+var _ connect.Interceptor = (*RequestLoggingInterceptor)(nil)
+
+type RequestLoggingInterceptor struct {
+	logger *slog.Logger
+}
+
+// WrapStreamingClient implements connect.Interceptor.
+func (i *RequestLoggingInterceptor) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return next
+}
+
+// WrapStreamingHandler implements connect.Interceptor.
+func (i *RequestLoggingInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return func(ctx context.Context, shc connect.StreamingHandlerConn) error {
+		return next(ctx, &wrappedStreamingHandlerConn{
+			onReceive: func(v any) {
+				i.logger.DebugContext(ctx, "streaming_request", slog.Any("request", v))
+			},
+			StreamingHandlerConn: shc,
+		})
+	}
+}
+
+// WrapUnary implements connect.Interceptor.
+func (i *RequestLoggingInterceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		i.logger.DebugContext(ctx, "unary_request", slog.Any("request", req.Any()))
+		return next(ctx, req)
+	}
+}
+
+type wrappedStreamingHandlerConn struct {
+	onReceive func(any)
+	connect.StreamingHandlerConn
+}
+
+func (w *wrappedStreamingHandlerConn) Receive(v any) error {
+	err := w.StreamingHandlerConn.Receive(v)
+	if err != nil {
+		return err
+	}
+	w.onReceive(v)
+	return nil
 }
